@@ -1,0 +1,220 @@
+name: senaite
+type: service
+icon: senaite
+title: SENAITE LIMS
+guidance: GUIDANCE.md
+# Every replica is a client of the same ZEO server.
+scalable: true
+
+labels:
+- senaite
+- lims
+
+options:
+- version: '2.6'
+  tag: 2.6-r0
+  default: true
+
+endpoints:
+- name: senaite
+  ports:
+  - name: http
+    number: 8080
+    protocol: http
+    main: true
+    routeDefaults:
+      https_redirect: 'true'
+
+links:
+# SENAITE's database and uploaded files live on the ZEO server.
+- name: zeo
+  title: SENAITE database (ZEO)
+  required: true
+  selectors:
+  - type: service
+    labels:
+    - senaite-zeo
+  env:
+  - name: ZEO_ADDRESS
+    value: '{{link.host}}:{{link.port}}'
+# SENAITE keeps its mail settings in the site. With this link, senaite-update
+# points them at the linked server while the site still has Plone's default
+# (localhost) or the server it linked before; a server set in SENAITE's mail
+# settings is kept.
+- name: sendmail
+  title: SMTP server
+  selectors:
+  - type: service
+    labels:
+    - smtpd
+  env:
+  - name: SMTP_HOST
+    value: '{{link.host}}'
+  - name: SMTP_PORT
+    value: '{{link.port}}'
+  - name: SENAITE_EMAIL_FROM
+    value: 'noreply@{{service.primaryHost}}'
+
+settings:
+# The administrator the first deployment creates with the site, so nobody
+# else can set the site up.
+- name: admin-username
+  title: Admin username
+  description: Username of the SENAITE administrator. Used only when the first deployment creates the site.
+  default: admin
+  var: SENAITE_ADMIN_USERNAME
+- name: admin-password
+  title: Admin password
+  description: Password of the SENAITE administrator, at least 12 characters. Used only when the first deployment creates the site; change it in SENAITE afterwards.
+  required: true
+  secret: true
+  var: SENAITE_ADMIN_PASSWORD
+- name: admin-email
+  title: Admin email
+  description: Email address of the SENAITE administrator. Used only when the first deployment creates the site.
+  var: SENAITE_ADMIN_EMAIL
+- name: language
+  title: Language
+  description: Language of the site, such as de or pt-br. Used only when the first deployment creates the site.
+  default: en
+  var: SENAITE_LANGUAGE
+- name: timezone
+  title: Time zone
+  description: Time zone of the site, such as Europe/Berlin. Used only when the first deployment creates the site; change it in SENAITE's date and time settings afterwards.
+  default: UTC
+  var: SENAITE_TIMEZONE
+
+actions:
+# Creates the site and its administrator on the first deployment and applies
+# the upgrade steps of a newer SENAITE on later ones.
+- name: update
+  title: Create or upgrade the site
+  args:
+  - senaite-update
+  type: post_deploy
+  timeoutSeconds: 1800
+
+# Removes old object revisions and files nothing uses, keeping a week of
+# history for undo.
+cron:
+- name: pack
+  title: Pack the database
+  command: senaite-pack 7
+  schedule: 30 3 * * 0
+
+deployment:
+  strategy: rolling
+  maxUnavailable: 0
+  maxSurge: 1
+  minReady: 10s
+  progressDeadline: 15m
+  shutdownGracePeriod: 30s
+
+helm:
+  name: wodby
+  source: oci://registry-1.docker.io/wodby/stateless
+  chart: oci://registry-1.docker.io/wodby/stateless
+  version: 0.4.0
+  valueMappings:
+    replicas: replicaCount
+    serviceAccountName: serviceAccount.name
+    serviceAccountCreate: serviceAccount.create
+  values:
+  - name: containerName
+    value: senaite
+  - name: containerPorts
+    value:
+    - name: http
+      containerPort: 8080
+      protocol: TCP
+  - name: serviceAccount.automount
+    value: false
+  - name: podSecurityContext
+    value:
+      fsGroup: 1000
+      fsGroupChangePolicy: OnRootMismatch
+  - name: securityContext
+    value:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+      readOnlyRootFilesystem: true
+      runAsGroup: 1000
+      runAsNonRoot: true
+      runAsUser: 1000
+  # The ZEO client's file cache (up to 1 GB), compiled templates and request
+  # bodies.
+  - name: extraVolumes
+    value:
+    - name: cache
+      emptyDir:
+        sizeLimit: 2Gi
+    - name: tmp
+      emptyDir:
+        sizeLimit: 2Gi
+  - name: extraVolumeMounts
+    value:
+    - name: cache
+      mountPath: /var/cache/senaite
+    - name: tmp
+      mountPath: /tmp
+  # /.healthz is answered by Zope's root, so a pod becomes ready before the
+  # first deployment creates the site.
+  - name: startupProbe
+    value:
+      httpGet:
+        path: /.healthz
+        port: http
+      failureThreshold: 60
+      periodSeconds: 5
+      timeoutSeconds: 5
+  - name: readinessProbe
+    value:
+      httpGet:
+        path: /.healthz
+        port: http
+      failureThreshold: 3
+      periodSeconds: 10
+      timeoutSeconds: 5
+  - name: livenessProbe
+    value:
+      httpGet:
+        path: /.healthz
+        port: http
+      failureThreshold: 6
+      periodSeconds: 20
+      timeoutSeconds: 10
+
+workloads:
+- name: main
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+  kind: deployment
+  primary: true
+  helm:
+    labels: podLabels
+    annotations: podAnnotations
+    volumes: extraVolumes
+  containers:
+  - name: senaite
+    image: wodby/senaite
+    resources:
+      request:
+        cpu: 50
+        memory: 512
+      limit:
+        cpu: 2000
+        memory: 2048
+    helm:
+      resources: resources
+      env: envVars
+      mounts: extraVolumeMounts
+      image:
+        repository: image.repository
+        tag: image.tag
+        registry: image.registry
+        pullPolicy: image.pullPolicy
+
+workspace: false
